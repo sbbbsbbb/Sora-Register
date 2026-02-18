@@ -23,3 +23,7 @@ env/
 # 日志与临时
 *.log
 .DS_Store
+
+# 调试与测试（勿提交）
+debug_*.html
+tests/
