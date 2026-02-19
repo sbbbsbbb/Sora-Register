@@ -38,6 +38,8 @@ class SettingsBody(BaseModel):
     captcha_api_key: str = ""
     card_use_limit: str = "1"
     phone_bind_limit: str = "1"
+    oauth_client_id: str = ""
+    oauth_redirect_uri: str = ""
     admin_username: str = ""
     admin_password: str = ""
 
@@ -81,6 +83,8 @@ def update_settings(body: SettingsBody, username: str = Depends(get_current_user
             ("captcha_api_key", body.captcha_api_key),
             ("card_use_limit", body.card_use_limit),
             ("phone_bind_limit", body.phone_bind_limit),
+            ("oauth_client_id", (body.oauth_client_id or "").strip()),
+            ("oauth_redirect_uri", (body.oauth_redirect_uri or "").strip()),
         ]:
             c.execute(
                 "INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)",

@@ -21,7 +21,11 @@ def _log_run(task_id: str, level: str, message: str):
     try:
         with get_db() as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)", (task_id, level, message))
+            created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            c.execute(
+                "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, level, message, created),
+            )
     except Exception:
         pass
 

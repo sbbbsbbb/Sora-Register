@@ -1,17 +1,20 @@
 """
-协议版 ChatGPT 注册（本仓库只做协议）
+协议版 ChatGPT 注册（严格按 protocol_keygen 一套）
 入口：register_one_protocol(email, password, jwt_token, get_otp_fn, user_info, **kwargs)。
-流程：visit_homepage -> get_csrf -> signin -> authorize -> [GET create-account/password] -> register -> send_otp -> validate_otp -> create_account -> callback。
-与参考 chatgpt_register.py 对齐：Chrome 指纹(sec-ch-ua*)、oai-did cookie、traceparent/datadog 头、
-signin(login_or_signup+login_hint)、authorize 不追加参数、register/send_otp/validate_otp/create_account 的 URL 与头。
+流程（keygen 单流程）：GET /oauth/authorize(screen_hint=signup) -> POST authorize/continue(sentinel) -> GET create-account/password -> POST user/register(sentinel) -> send_otp -> 邮局取验证码 -> validate_otp -> create_account -> callback -> 取 code 换 AT/RT 或 8.6 登录取 code 换 RT -> 返回 tokens 供 runner 写入账号列表。
+邮箱/代理/OAuth Client ID 等均从配置（Web 系统设置）获取。
 """
 
+import base64
+import hashlib
+import json
 import os
 import random
 import re
+import secrets
 import time
 import uuid
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,8 +33,42 @@ except ImportError:
     curl_requests = None
     CURL_CFFI_AVAILABLE = False
 
+try:
+    from protocol_sentinel import build_sentinel_token, build_sentinel_token_pow_only
+except Exception:
+    try:
+        from protocol.protocol_sentinel import build_sentinel_token, build_sentinel_token_pow_only
+    except Exception:
+        build_sentinel_token = None
+        build_sentinel_token_pow_only = None
+
 CHATGPT_ORIGIN = "https://chatgpt.com"
 AUTH_ORIGIN = "https://auth.openai.com"
+
+# OAuth Code 换 Token（Codex / ChatGPT），运行时从 cfg.oauth 读（Web 下为系统设置）
+OAUTH_ISSUER = AUTH_ORIGIN
+
+
+def _get_oauth_client_id() -> str:
+    return (getattr(getattr(cfg, "oauth", None), "client_id", None) or "").strip()
+
+
+def _get_oauth_redirect_uri() -> str:
+    return (getattr(getattr(cfg, "oauth", None), "redirect_uri", None) or "").strip() or f"{CHATGPT_ORIGIN}/"
+
+
+def _has_cookie(session, name: str) -> bool:
+    """兼容 requests 与 curl_cffi：判断 session 是否含有名为 name 的 cookie。"""
+    try:
+        if getattr(session.cookies, "get", None):
+            if session.cookies.get(name):
+                return True
+        for c in getattr(session, "cookies", []):
+            if getattr(c, "name", None) == name:
+                return True
+    except Exception:
+        pass
+    return False
 
 # 密码规则：OpenAI 要求最少 12 位
 PASSWORD_MIN_LENGTH = 12
@@ -148,64 +185,7 @@ def _make_session(device_id: str = None):
     return session
 
 
-# -------------------- 注册流程步骤（与参考一致） --------------------
-
-def _visit_homepage(session):
-    """与参考一致：GET chatgpt.com/"""
-    url = f"{CHATGPT_ORIGIN}/"
-    session.get(url, headers={
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Upgrade-Insecure-Requests": "1",
-    }, timeout=HTTP_TIMEOUT, allow_redirects=True)
-
-
-def _get_csrf(session) -> str:
-    url = f"{CHATGPT_ORIGIN}/api/auth/csrf"
-    r = session.get(url, headers={"Accept": "application/json", "Referer": f"{CHATGPT_ORIGIN}/"}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    token = data.get("csrfToken", "")
-    if not token:
-        raise ValueError("Failed to get CSRF token")
-    return token
-
-
-def _signin(session, email: str, csrf: str, device_id: str, auth_session_logging_id: str) -> str:
-    """与参考一致：screen_hint=login_or_signup, login_hint=email"""
-    url = f"{CHATGPT_ORIGIN}/api/auth/signin/openai"
-    params = {
-        "prompt": "login",
-        "ext-oai-did": device_id,
-        "auth_session_logging_id": auth_session_logging_id,
-        "screen_hint": "login_or_signup",
-        "login_hint": email,
-    }
-    form_data = {"callbackUrl": f"{CHATGPT_ORIGIN}/", "csrfToken": csrf, "json": "true"}
-    r = session.post(url, params=params, data=form_data, headers={
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-        "Referer": f"{CHATGPT_ORIGIN}/",
-        "Origin": CHATGPT_ORIGIN,
-    }, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    authorize_url = data.get("url", "")
-    if not authorize_url:
-        raise ValueError("Failed to get authorize URL")
-    return authorize_url
-
-
-def _authorize(session, url: str) -> str:
-    """GET 授权 URL；若未带 signup 则追加 screen_hint=signup，避免落到 log-in/password（登录）导致 invalid_auth_step。"""
-    if "screen_hint=signup" not in url and "create-account" not in url:
-        url = url + ("&" if "?" in url else "?") + "screen_hint=signup"
-    r = session.get(url, headers={
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": f"{CHATGPT_ORIGIN}/",
-        "Upgrade-Insecure-Requests": "1",
-    }, timeout=HTTP_TIMEOUT, allow_redirects=True)
-    return str(r.url)
-
+# -------------------- 注册流程步骤（keygen 单流程） --------------------
 
 def _ensure_password_page(session, state: str = None) -> None:
     """Authorize 后 GET create-account/password，确保会话处于密码页步骤（与参考中 final_path 含 create-account/password 等价）。"""
@@ -219,17 +199,100 @@ def _ensure_password_page(session, state: str = None) -> None:
     }, timeout=HTTP_TIMEOUT, allow_redirects=True)
 
 
-def _register(session, email: str, password: str, state: str = None):
+def _keygen_step0_oauth_and_continue(session, email: str, device_id: str, code_verifier: str, code_challenge: str, _step) -> bool:
+    """
+    keygen 可注册方案：GET /oauth/authorize (screen_hint=signup) + POST authorize/continue 带 sentinel。
+    代理从 config 的 get_proxy_url_for_session 已注入到 session。
+    """
+    client_id = _get_oauth_client_id()
+    if not client_id:
+        _step("[*] keygen 需配置 OAuth Client ID，跳过 Sentinel 流程")
+        return False
+    redirect_uri = _get_oauth_redirect_uri()
+    state = secrets.token_urlsafe(32)
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": "openid profile email offline_access",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "screen_hint": "signup",
+        "prompt": "login",
+    }
+    authorize_url = f"{AUTH_ORIGIN}/oauth/authorize?{urlencode(params)}"
+    _step("[*] keygen 0a GET /oauth/authorize (screen_hint=signup)")
+    # 从 chatgpt 点注册进入 auth 时，需 Referer + sec-fetch-site: cross-site 才能拿到 login_session
+    nav_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"{CHATGPT_ORIGIN}/",
+        "Upgrade-Insecure-Requests": "1",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "cross-site",
+        "sec-fetch-user": "?1",
+    }
+    try:
+        r = session.get(authorize_url, headers=nav_headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        print(f"[x] keygen 0a 失败: {e}", flush=True)
+        return False
+    if not _has_cookie(session, "login_session"):
+        status = getattr(r, "status_code", None)
+        final_url = getattr(r, "url", "") or ""
+        _step(f"[*] keygen 0a 未获得 login_session (HTTP {status} -> {final_url[:90]}...)")
+        if status == 403:
+            print("[x] 0a 返回 403，多为当前 IP/代理被风控，请更换代理或网络后重试", flush=True)
+        return False
+    if not build_sentinel_token:
+        _step("[*] keygen 需 protocol_sentinel，跳过 Sentinel 流程")
+        return False
+    sentinel_token = build_sentinel_token(session, device_id, flow="authorize_continue")
+    if not sentinel_token:
+        _step("[*] keygen 获取 sentinel token 失败")
+        return False
+    _step("[*] keygen 0b POST authorize/continue + sentinel")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": f"{AUTH_ORIGIN}/create-account",
+        "Origin": AUTH_ORIGIN,
+        "oai-device-id": device_id,
+        "openai-sentinel-token": sentinel_token,
+    }
+    headers.update(_make_trace_headers())
+    try:
+        r = session.post(
+            f"{AUTH_ORIGIN}/api/accounts/authorize/continue",
+            json={"username": {"kind": "email", "value": email}, "screen_hint": "signup"},
+            headers=headers,
+            timeout=HTTP_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"[x] keygen 0b 失败: {e}", flush=True)
+        return False
+    if r.status_code != 200:
+        _step(f"[*] keygen 0b 返回 {r.status_code}")
+        return False
+    return True
+
+
+def _register_with_sentinel(session, email: str, password: str, device_id: str, _step) -> tuple:
+    """keygen 方案：POST user/register 带 openai-sentinel-token（keygen 用 PoW 字符串）。"""
     url = f"{AUTH_ORIGIN}/api/accounts/user/register"
-    # Referer 仅路径，不带 state，避免服务端 state 校验过严导致 409
     referer = f"{AUTH_ORIGIN}/create-account/password"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Referer": referer,
         "Origin": AUTH_ORIGIN,
+        "oai-device-id": device_id,
     }
     headers.update(_make_trace_headers())
+    if build_sentinel_token_pow_only:
+        headers["openai-sentinel-token"] = build_sentinel_token_pow_only(device_id)
     r = session.post(url, json={"username": email, "password": password}, headers=headers, timeout=HTTP_TIMEOUT)
     try:
         data = r.json()
@@ -237,9 +300,8 @@ def _register(session, email: str, password: str, state: str = None):
         data = {"text": (r.text or "")[:500]}
     if r.status_code == 409:
         err = data.get("error") or {}
-        print(f"[x] 4. Register 409: {err}", flush=True)
-        # 409 invalid_state 多为当前 IP/出口被风控；可换住宅代理或使用浏览器自动化（Playwright）完成 1～4 步
-        if err.get("code") == "invalid_state" or "invalid" in str(err).lower():
+        err_code = err.get("code") if isinstance(err, dict) else None
+        if err_code == "invalid_state" or (isinstance(err, dict) and "invalid" in str(err).lower()):
             raise RetryException("Step register returned 409 invalid_state")
     return r.status_code, data
 
@@ -295,15 +357,39 @@ def _create_account(session, name: str, birthdate: str):
 def _callback(session, url: str):
     if not url or not url.startswith("http"):
         return None, None
-    r = session.get(url, headers={
+    headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Upgrade-Insecure-Requests": "1",
-    }, timeout=HTTP_TIMEOUT, allow_redirects=True)
-    return r.status_code, {"final_url": str(r.url)}
+    }
+    r_first = session.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=False)
+    body_first = (r_first.text or "")[:50000]
+    location = r_first.headers.get("Location") or r_first.headers.get("location") or ""
+    if r_first.status_code in (301, 302, 303, 307, 308) and location:
+        r = session.get(location, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        body = (r.text or "")[:50000]
+        final_url = str(r.url)
+    else:
+        r = r_first
+        body = body_first
+        final_url = str(r.url)
+    if not body and body_first:
+        body = body_first
+    return r.status_code, {"final_url": final_url, "body": body, "first_location": location}
 
 
-def _parse_refresh_token_from_url(final_url: str) -> str:
-    """从 callback 最终 URL 的 query 或 fragment 中解析 refresh_token。"""
+def _generate_code_verifier() -> str:
+    """PKCE code_verifier，43~128 字符。"""
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+def _generate_code_challenge(verifier: str) -> str:
+    """PKCE S256 code_challenge。"""
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _parse_code_from_url(final_url: str) -> str:
+    """从 callback 最终 URL 的 query 或 fragment 中解析 OAuth code。"""
     if not final_url or not isinstance(final_url, str):
         return ""
     try:
@@ -312,12 +398,488 @@ def _parse_refresh_token_from_url(final_url: str) -> str:
             if not part:
                 continue
             params = parse_qs(part, keep_blank_values=False)
-            for key in ("refresh_token", "refresh_token_secret"):
-                vals = params.get(key) or params.get(key.replace("_", "."))
+            for key in ("code",):
+                vals = params.get(key)
                 if vals and isinstance(vals[0], str) and vals[0].strip():
                     return vals[0].strip()
     except Exception:
         pass
+    return ""
+
+
+def _parse_code_from_body(body: str) -> str:
+    """从 callback 响应体（HTML/JSON）中解析 OAuth code。"""
+    if not body or not isinstance(body, str):
+        return ""
+    try:
+        stripped = body.strip()
+        if stripped.startswith("{"):
+            data = json.loads(body)
+            if isinstance(data, dict):
+                c = data.get("code") or data.get("authorization_code")
+                if isinstance(c, str) and len(c.strip()) > 5:
+                    return c.strip()
+        m = re.search(r"[\?&]code=([^&\s\"'<>]+)", body)
+        if m and m.group(1) and len(m.group(1).strip()) > 5:
+            return m.group(1).strip()
+        m = re.search(r"[\"']code[\"']\s*:\s*[\"']([^\"']{10,})[\"']", body, re.I)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_tokens_from_body(body: str) -> dict:
+    """从 callback 响应体（HTML/JSON）中解析 refresh_token、access_token。"""
+    out = {"refresh_token": "", "access_token": ""}
+    if not body or not isinstance(body, str):
+        return out
+    try:
+        stripped = body.strip()
+        if stripped.startswith("{"):
+            data = json.loads(body)
+            if isinstance(data, dict):
+                for key in ("refresh_token", "refresh_token_secret"):
+                    v = data.get(key)
+                    if isinstance(v, str) and len(v.strip()) > 10:
+                        out["refresh_token"] = v.strip()
+                        break
+                for key in ("access_token", "token"):
+                    v = data.get(key)
+                    if isinstance(v, str) and len(v.strip()) > 10:
+                        out["access_token"] = v.strip()
+                        break
+                for nest in ("session", "credentials", "auth"):
+                    obj = data.get(nest)
+                    if isinstance(obj, dict):
+                        if not out["refresh_token"]:
+                            v = obj.get("refresh_token") or obj.get("refresh_token_secret")
+                            if isinstance(v, str) and len(v.strip()) > 10:
+                                out["refresh_token"] = v.strip()
+                        if not out["access_token"]:
+                            v = obj.get("access_token") or obj.get("token")
+                            if isinstance(v, str) and len(v.strip()) > 10:
+                                out["access_token"] = v.strip()
+        for key_rt in ("refresh_token", "refresh_token_secret"):
+            m = re.search(r"[\"']" + re.escape(key_rt) + r"[\"']\s*:\s*[\"']([^\"']{15,})[\"']", body, re.I)
+            if m and not out["refresh_token"]:
+                out["refresh_token"] = m.group(1).strip()
+                break
+        for key_at in ("access_token", "token"):
+            m = re.search(r"[\"']" + re.escape(key_at) + r"[\"']\s*:\s*[\"']([^\"']{15,})[\"']", body, re.I)
+            if m and not out["access_token"]:
+                out["access_token"] = m.group(1).strip()
+                break
+    except Exception:
+        pass
+    return out
+
+
+# 注册后「登录取 code」专用 redirect_uri：服务端会 302 到此 URL 并带 code=，从 Location 头解析即可，无需起本地服务
+LOGIN_REDIRECT_URI_FOR_CODE = "http://localhost:1455/auth/callback"
+
+
+def codex_exchange_code(session, code: str, code_verifier: str, redirect_uri: str = None):
+    """
+    用 authorization code 换取 Codex/ChatGPT tokens。
+    POST https://auth.openai.com/oauth/token
+    redirect_uri 需与拿 code 时一致；不传则用系统设置或 chatgpt.com/。
+    返回含 access_token、refresh_token 等的 dict，失败返回 None。
+    """
+    client_id = _get_oauth_client_id()
+    if not client_id:
+        return None
+    uri = (redirect_uri or "").strip() or _get_oauth_redirect_uri()
+    try:
+        resp = session.post(
+            f"{OAUTH_ISSUER}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": uri,
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+            },
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"  Token 交换失败: {e}", flush=True)
+        return None
+    if resp.status_code == 200:
+        data = resp.json()
+        return data
+    try:
+        err_text = (resp.text or "")[:300]
+        print(f"  Token 交换失败: HTTP {resp.status_code} - {err_text}", flush=True)
+    except Exception:
+        print(f"  Token 交换失败: HTTP {resp.status_code}", flush=True)
+    return None
+
+
+def _decode_oai_session_cookie(session) -> dict:
+    """从 oai-client-auth-session cookie 解码 JSON（尝试各 segment）。"""
+    val = ""
+    try:
+        val = (session.cookies.get("oai-client-auth-session") or "") if hasattr(session, "cookies") else ""
+    except Exception:
+        pass
+    if not val:
+        for c in getattr(session, "cookies", []):
+            if getattr(c, "name", None) == "oai-client-auth-session":
+                val = getattr(c, "value", "") or ""
+                break
+    if not val:
+        return {}
+    for i, part in enumerate(val.split(".")[:3]):
+        if not part:
+            continue
+        pad = 4 - len(part) % 4
+        if pad != 4:
+            part = part + ("=" * pad)
+        try:
+            raw = base64.urlsafe_b64decode(part)
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            continue
+    return {}
+
+
+def _follow_consent_to_code(session, start_url: str, _step, max_depth: int = 15) -> str:
+    """跟随 consent 重定向链，从 302 Location 中解析 code（redirect_uri 为 localhost 时 Location 会带 code=）。"""
+    url = start_url
+    if not url or not url.startswith("http"):
+        url = f"{AUTH_ORIGIN}{start_url}" if start_url.startswith("/") else ""
+    if not url:
+        return ""
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": f"{AUTH_ORIGIN}/",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    for _ in range(max_depth):
+        try:
+            r = session.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=False)
+        except Exception as e:
+            if "localhost" in str(e) or "1455" in str(e):
+                m = re.search(r"(https?://localhost[^\s\'\"<>]+)", str(e))
+                if m:
+                    return _parse_code_from_url(m.group(1))
+            return ""
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
+            if not loc:
+                return ""
+            code = _parse_code_from_url(loc)
+            if code:
+                return code
+            url = loc if loc.startswith("http") else f"{AUTH_ORIGIN}{loc}"
+            continue
+        if r.status_code == 200:
+            code = _parse_code_from_url(r.url)
+            if code:
+                return code
+        return ""
+    return ""
+
+
+def _oauth_login_get_tokens(session, email: str, password: str, get_otp_fn, _step) -> dict:
+    """
+    注册成功后用「邮箱+密码」再走一遍 OAuth 登录，从 consent 重定向到 localhost 的 Location 中拿 code，再换 AT/RT。
+    确保能拿到 token；若服务端要求 sentinel 等可能 403，则返回空 dict。
+    """
+    client_id = _get_oauth_client_id()
+    if not client_id:
+        return {}
+    _step("[*] 8.6 注册后登录取 code 换 AT/RT...")
+    device_id = str(uuid.uuid4())
+    try:
+        session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+        session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+    except Exception:
+        pass
+    code_verifier = _generate_code_verifier()
+    code_challenge = _generate_code_challenge(code_verifier)
+    state = secrets.token_urlsafe(32)
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": LOGIN_REDIRECT_URI_FOR_CODE,
+        "scope": "openid profile email offline_access",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    authorize_url = f"{AUTH_ORIGIN}/oauth/authorize?{urlencode(params)}"
+    nav_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": f"{AUTH_ORIGIN}/",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        r = session.get(authorize_url, headers=nav_headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        _step(f"[*] 8.6 authorize 请求失败: {e}")
+        return {}
+    if not _has_cookie(session, "login_session"):
+        _step("[*] 8.6 未获得 login_session，可能需 sentinel")
+    api_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": f"{AUTH_ORIGIN}/log-in",
+        "Origin": AUTH_ORIGIN,
+        "oai-device-id": device_id,
+    }
+    api_headers.update(_make_trace_headers())
+    if build_sentinel_token:
+        sentinel_ac = build_sentinel_token(session, device_id, flow="authorize_continue")
+        if sentinel_ac:
+            api_headers["openai-sentinel-token"] = sentinel_ac
+    try:
+        r = session.post(
+            f"{AUTH_ORIGIN}/api/accounts/authorize/continue",
+            json={"username": {"kind": "email", "value": email}},
+            headers=api_headers,
+            timeout=HTTP_TIMEOUT,
+        )
+    except Exception as e:
+        _step(f"[*] 8.6 authorize/continue 失败: {e}")
+        return {}
+    if r.status_code != 200:
+        _step(f"[*] 8.6 authorize/continue {r.status_code}（若 403 可能需 sentinel）")
+        try:
+            _step(f"[*] 8.6 响应: {(r.text or '')[:200]}")
+        except Exception:
+            pass
+        return {}
+    api_headers["Referer"] = f"{AUTH_ORIGIN}/log-in/password"
+    api_headers.update(_make_trace_headers())
+    if build_sentinel_token:
+        sentinel_pw = build_sentinel_token(session, device_id, flow="password_verify")
+        if sentinel_pw:
+            api_headers["openai-sentinel-token"] = sentinel_pw
+    try:
+        r = session.post(
+            f"{AUTH_ORIGIN}/api/accounts/password/verify",
+            json={"password": password},
+            headers=api_headers,
+            timeout=HTTP_TIMEOUT,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        _step(f"[*] 8.6 password/verify 失败: {e}")
+        return {}
+    if r.status_code != 200:
+        _step(f"[*] 8.6 password/verify {r.status_code}（若 403 可能需 sentinel）")
+        try:
+            _step(f"[*] 8.6 响应: {(r.text or '')[:200]}")
+        except Exception:
+            pass
+        return {}
+    try:
+        data = r.json()
+        continue_url = (data.get("continue_url") or "").strip()
+        page_type = (data.get("page") or {}).get("type", "")
+    except Exception:
+        continue_url = ""
+        page_type = ""
+    if not continue_url:
+        _step("[*] 8.6 password/verify 200 但无 continue_url")
+        return {}
+    _step(f"[*] 8.6 continue_url: {continue_url[:80]}...")
+    if page_type == "email_otp_verification" or "email-verification" in continue_url:
+        code_otp = get_otp_fn() if get_otp_fn else None
+        if not code_otp:
+            _step("[*] 8.6 需要邮箱验证码但未提供 get_otp_fn 或未取到")
+            return {}
+        code_otp = re.sub(r"\D", "", str(code_otp).strip())[:6]
+        api_headers["Referer"] = f"{AUTH_ORIGIN}/email-verification"
+        api_headers.update(_make_trace_headers())
+        try:
+            r = session.post(
+                f"{AUTH_ORIGIN}/api/accounts/email-otp/validate",
+                json={"code": code_otp},
+                headers=api_headers,
+                timeout=HTTP_TIMEOUT,
+            )
+        except Exception:
+            return {}
+        if r.status_code != 200:
+            _step(f"[*] 8.6 email-otp/validate {r.status_code}")
+            return {}
+        try:
+            data = r.json()
+            continue_url = (data.get("continue_url") or "").strip()
+        except Exception:
+            pass
+    if not continue_url:
+        return {}
+    consent_url = continue_url if continue_url.startswith("http") else f"{AUTH_ORIGIN}{continue_url}"
+    auth_code = _follow_consent_to_code(session, consent_url, _step)
+    if not auth_code:
+        _step("[*] 8.6 直接 GET consent 未拿到 code，尝试 workspace/select...")
+        session_data = _decode_oai_session_cookie(session)
+        workspaces = (session_data or {}).get("workspaces") or []
+        workspace_id = workspaces[0].get("id") if workspaces else None
+        if workspace_id:
+            api_headers["Referer"] = consent_url
+            api_headers.update(_make_trace_headers())
+            try:
+                r = session.post(
+                    f"{AUTH_ORIGIN}/api/accounts/workspace/select",
+                    json={"workspace_id": workspace_id},
+                    headers=api_headers,
+                    timeout=HTTP_TIMEOUT,
+                    allow_redirects=False,
+                )
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
+                    auth_code = _parse_code_from_url(loc)
+                    if not auth_code and loc:
+                        auth_code = _follow_consent_to_code(
+                            session, loc if loc.startswith("http") else f"{AUTH_ORIGIN}{loc}", _step
+                        )
+                elif r.status_code == 200:
+                    try:
+                        ws_data = r.json()
+                        ws_next = (ws_data.get("continue_url") or "").strip()
+                        if ws_next:
+                            auth_code = _follow_consent_to_code(
+                                session,
+                                ws_next if ws_next.startswith("http") else f"{AUTH_ORIGIN}{ws_next}",
+                                _step,
+                            )
+                        if not auth_code:
+                            orgs = (ws_data.get("data") or {}).get("orgs") or []
+                            if orgs:
+                                org_id = orgs[0].get("id")
+                                proj = (orgs[0].get("projects") or [{}])[0].get("id") if orgs[0].get("projects") else None
+                                body = {"org_id": org_id}
+                                if proj:
+                                    body["project_id"] = proj
+                                api_headers["Referer"] = consent_url
+                                api_headers.update(_make_trace_headers())
+                                r2 = session.post(
+                                    f"{AUTH_ORIGIN}/api/accounts/organization/select",
+                                    json=body,
+                                    headers=api_headers,
+                                    timeout=HTTP_TIMEOUT,
+                                    allow_redirects=False,
+                                )
+                                if r2.status_code in (301, 302, 303, 307, 308):
+                                    loc2 = (r2.headers.get("Location") or r2.headers.get("location") or "").strip()
+                                    auth_code = _parse_code_from_url(loc2) or _follow_consent_to_code(
+                                        session, loc2 if loc2.startswith("http") else f"{AUTH_ORIGIN}{loc2}", _step
+                                    )
+                                elif r2.status_code == 200:
+                                    try:
+                                        next_url = (r2.json().get("continue_url") or "").strip()
+                                        if next_url:
+                                            auth_code = _follow_consent_to_code(
+                                                session,
+                                                next_url if next_url.startswith("http") else f"{AUTH_ORIGIN}{next_url}",
+                                                _step,
+                                            )
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        _step(f"[*] 8.6 workspace 响应解析异常: {e}")
+            except Exception as e:
+                _step(f"[*] 8.6 workspace/select 请求异常: {e}")
+        else:
+            _step("[*] 8.6 无 workspace_id（cookie 无 workspaces）")
+    if not auth_code:
+        _step("[*] 8.6 跟随 consent 未解析到 code")
+        return {}
+    _step("[*] 8.6 已从 consent 拿到 code，换取 token...")
+    exchange = codex_exchange_code(session, auth_code, code_verifier, redirect_uri=LOGIN_REDIRECT_URI_FOR_CODE)
+    if not exchange:
+        _step("[*] 8.6 code 换 token 失败，请确认 OAuth 应用已添加 redirect_uri: http://localhost:1455/auth/callback")
+        return {}
+    if not exchange.get("refresh_token"):
+        _step("[*] 8.6 换 token 成功但响应无 refresh_token")
+    return dict(exchange)
+
+
+def decode_jwt_payload(token: str) -> dict:
+    """解析 JWT token 的 payload 部分。"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += "=" * padding
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+def _parse_tokens_from_url(final_url: str) -> dict:
+    """从 callback 最终 URL 的 query 或 fragment 中解析 refresh_token、access_token。返回 {\"refresh_token\": \"\", \"access_token\": \"\"}。"""
+    out = {"refresh_token": "", "access_token": ""}
+    if not final_url or not isinstance(final_url, str):
+        return out
+    try:
+        parsed = urlparse(final_url)
+        for part in (parsed.query, parsed.fragment):
+            if not part:
+                continue
+            params = parse_qs(part, keep_blank_values=False)
+            for key_rt in ("refresh_token", "refresh_token_secret"):
+                vals = params.get(key_rt) or params.get(key_rt.replace("_", "."))
+                if vals and isinstance(vals[0], str) and len(vals[0].strip()) > 10:
+                    out["refresh_token"] = vals[0].strip()
+                    break
+            for key_at in ("access_token", "token"):
+                vals = params.get(key_at) or params.get(key_at.replace("_", "."))
+                if vals and isinstance(vals[0], str) and len(vals[0].strip()) > 10:
+                    out["access_token"] = vals[0].strip()
+                    break
+    except Exception:
+        pass
+    return out
+
+
+def _parse_refresh_token_from_url(final_url: str) -> str:
+    """从 callback 最终 URL 的 query 或 fragment 中解析 refresh_token（兼容旧逻辑）。"""
+    return _parse_tokens_from_url(final_url).get("refresh_token", "") or ""
+
+
+def _get_access_token_from_response(data: dict) -> str:
+    """从 create_account 等接口的 JSON 响应中提取 access_token。"""
+    if not data or not isinstance(data, dict):
+        return ""
+    for key in ("access_token", "token"):
+        v = data.get(key)
+        if isinstance(v, str) and len(v.strip()) > 10:
+            return v.strip()
+    for nest in ("session", "credentials", "auth", "token"):
+        obj = data.get(nest)
+        if isinstance(obj, dict):
+            v = obj.get("access_token") or obj.get("token")
+            if isinstance(v, str) and len(v.strip()) > 10:
+                return v.strip()
+    return ""
+
+
+def _get_refresh_token_from_response(data: dict) -> str:
+    """从 create_account 等接口的 JSON 响应中提取 refresh_token。"""
+    if not data or not isinstance(data, dict):
+        return ""
+    for key in ("refresh_token", "refresh_token_secret"):
+        v = data.get(key)
+        if isinstance(v, str) and len(v.strip()) > 10:
+            return v.strip()
+    for nest in ("session", "credentials", "auth", "token"):
+        obj = data.get(nest)
+        if isinstance(obj, dict):
+            v = obj.get("refresh_token") or obj.get("refresh_token_secret")
+            if isinstance(v, str) and len(v.strip()) > 10:
+                return v.strip()
     return ""
 
 
@@ -355,54 +917,39 @@ def register_one_protocol(email: str, password: str, jwt_token: str, get_otp_fn,
     birthdate = f"{year}-{month}-{day}"
 
     device_id = str(uuid.uuid4())
-    auth_session_logging_id = str(uuid.uuid4())
     session = _make_session(device_id)
+    code_verifier = _generate_code_verifier()
+    code_challenge = _generate_code_challenge(code_verifier)
+    if not _get_oauth_client_id():
+        _step("[*] 未配置 OAuth Client ID，请在系统设置中填写")
+        return email, password, False
+    if not build_sentinel_token:
+        _step("[*] Sentinel 未加载，请确保 protocol_sentinel 可用")
+        return email, password, False
     try:
-        _step("[*] 0. Visit homepage")
-        _visit_homepage(session)
-        time.sleep(random.uniform(0.3, 0.8))
-
-        _step("[*] 1. Get CSRF")
-        csrf = _get_csrf(session)
+        _step("[*] 0. GET authorize + POST authorize/continue (sentinel)")
+        try:
+            session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+            session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+        except Exception:
+            pass
         time.sleep(random.uniform(0.2, 0.5))
-
-        _step("[*] 2. Signin")
-        authorize_url = _signin(session, email, csrf, device_id, auth_session_logging_id)
-        time.sleep(random.uniform(0.3, 0.8))
-
-        _step("[*] 3. Authorize")
-        final_url = _authorize(session, authorize_url)
-        state = None
-        if "state=" in final_url:
-            m = re.search(r"state=([^&\s]+)", final_url)
-            if m:
-                state = m.group(1)
-        time.sleep(random.uniform(0.3, 0.8))
-
-        on_password_page = "create-account/password" in final_url
-        on_email_verification = "email-verification" in final_url or "email-otp" in final_url
-
-        if on_password_page:
-            _step("[*] 3.5 GET create-account/password")
-            _ensure_password_page(session, state)
-            time.sleep(random.uniform(0.5, 1.0))
-            _step("[*] 4. Register (user/register)")
-            status_reg, data_reg = _register(session, email, password)
-            if status_reg not in (200, 201, 204):
-                print(f"[x] 4. Register failed: status={status_reg} data={data_reg}", flush=True)
-                return email, password, False
-            print("[ok] 4. Register OK", flush=True)
-            _step("")
-            _step("[*] 5. Send OTP")
-            status_otp, data_otp = _send_otp(session)
-            if status_otp not in (200, 201, 204) and (not isinstance(data_otp, dict) or data_otp.get("error")):
-                print(f"[x] 5. Send OTP failed: status={status_otp} data={data_otp}", flush=True)
-                return email, password, False
-        elif on_email_verification:
-            print("[*] 3. Authorize 已到 email-verification，跳过 4/5，直接等 OTP", flush=True)
-            _step("[*] (skip 4 Register + 5 Send OTP, authorize 已触发 OTP)")
-        else:
-            print(f"[x] 3. Authorize 意外落地: {final_url[:100]}", flush=True)
+        if not _keygen_step0_oauth_and_continue(session, email, device_id, code_verifier, code_challenge, _step):
+            return email, password, False
+        time.sleep(random.uniform(0.5, 1.0))
+        _step("[*] 1. GET create-account/password")
+        _ensure_password_page(session, None)
+        time.sleep(random.uniform(0.5, 1.0))
+        _step("[*] 2. Register (user/register + sentinel)")
+        status_reg, data_reg = _register_with_sentinel(session, email, password, device_id, _step)
+        if status_reg not in (200, 201, 204):
+            print(f"[x] 4. Register failed: status={status_reg} data={data_reg}", flush=True)
+            return email, password, False
+        print("[ok] 4. Register OK", flush=True)
+        _step("[*] 3. Send OTP")
+        status_otp, data_otp = _send_otp(session)
+        if status_otp not in (200, 201, 204) and (not isinstance(data_otp, dict) or data_otp.get("error")):
+            print(f"[x] 5. Send OTP failed: status={status_otp} data={data_otp}", flush=True)
             return email, password, False
 
         _step("[*] Waiting for email OTP...")
@@ -443,10 +990,84 @@ def register_one_protocol(email: str, password: str, jwt_token: str, get_otp_fn,
 
         print("[ok] Protocol registration success", flush=True)
         tokens = dict(data_create) if isinstance(data_create, dict) else {}
-        if isinstance(callback_data, dict) and callback_data.get("final_url"):
-            rt = _parse_refresh_token_from_url(callback_data["final_url"])
+
+        final_url = (callback_data or {}).get("final_url") if isinstance(callback_data, dict) else ""
+        callback_body = (callback_data or {}).get("body") if isinstance(callback_data, dict) else ""
+        first_location = (callback_data or {}).get("first_location") if isinstance(callback_data, dict) else ""
+        oauth_code = _parse_code_from_url(final_url) if final_url else ""
+        if not oauth_code and first_location:
+            oauth_code = _parse_code_from_url(first_location)
+        if not oauth_code and callback_body:
+            oauth_code = _parse_code_from_body(callback_body)
+        has_client_id = bool(_get_oauth_client_id())
+        if not has_client_id:
+            _step("[*] 未配置 OAuth Client ID，跳过 code 换 token；请在系统设置中填写以获取 AT/RT")
+        elif not oauth_code:
+            _step("[*] Callback URL 中无 code 参数，无法换 token（可能未走 PKCE 或服务端未返回 code）")
+        if oauth_code and code_verifier and has_client_id:
+            _step("[*] 8.5 用 code 换取 AT/RT...")
+            exchange = codex_exchange_code(session, oauth_code, code_verifier)
+            if exchange:
+                if exchange.get("access_token"):
+                    tokens["access_token"] = exchange["access_token"]
+                if exchange.get("refresh_token"):
+                    tokens["refresh_token"] = exchange["refresh_token"]
+                if exchange.get("id_token"):
+                    tokens["id_token"] = exchange["id_token"]
+                _step("[*] 8.5 AT/RT 已从 code 交换获取")
+            else:
+                _step("[*] 8.5 code 换 token 请求失败，请检查 Client ID / Redirect URI")
+
+        rt = tokens.get("refresh_token") or _get_refresh_token_from_response(tokens)
+        at = tokens.get("access_token") or _get_access_token_from_response(tokens)
+        if final_url:
+            url_tokens = _parse_tokens_from_url(final_url)
+            if url_tokens.get("refresh_token") and not rt:
+                rt = url_tokens["refresh_token"]
+            if url_tokens.get("access_token") and not at:
+                at = url_tokens["access_token"]
+        if first_location and (not rt or not at):
+            loc_tokens = _parse_tokens_from_url(first_location)
+            if loc_tokens.get("refresh_token") and not rt:
+                rt = loc_tokens["refresh_token"]
+            if loc_tokens.get("access_token") and not at:
+                at = loc_tokens["access_token"]
+        if callback_body and (not rt or not at):
+            body_tokens = _parse_tokens_from_body(callback_body)
+            if body_tokens.get("refresh_token") and not rt:
+                rt = body_tokens["refresh_token"]
+            if body_tokens.get("access_token") and not at:
+                at = body_tokens["access_token"]
+        if rt:
+            tokens["refresh_token"] = rt
+        if at:
+            tokens["access_token"] = at
+        if not rt:
+            rt = _get_refresh_token_from_response(data_create) if isinstance(data_create, dict) else ""
             if rt:
                 tokens["refresh_token"] = rt
+        if not at and isinstance(data_create, dict):
+            at = _get_access_token_from_response(data_create)
+            if at:
+                tokens["access_token"] = at
+
+        if (not tokens.get("refresh_token") or not tokens.get("access_token")) and has_client_id:
+            login_tokens = _oauth_login_get_tokens(session, email, password, get_otp_fn, _step)
+            if login_tokens:
+                if login_tokens.get("access_token"):
+                    tokens["access_token"] = login_tokens["access_token"]
+                if login_tokens.get("refresh_token"):
+                    tokens["refresh_token"] = login_tokens["refresh_token"]
+                if login_tokens.get("id_token"):
+                    tokens["id_token"] = login_tokens["id_token"]
+                _step("[*] 8.6 登录取 code 已拿到 AT/RT")
+
+        if not tokens.get("refresh_token"):
+            _step("[*] 8. Callback 完成，未解析到 refresh_token（可能需登录页再取）")
+            if isinstance(data_create, dict) and data_create:
+                _step(f"[*] create_account 响应键: {list(data_create.keys())}")
+        if tokens.get("refresh_token") or tokens.get("access_token"):
+            _step(f"[*] 最终: RT={'有' if tokens.get('refresh_token') else '无'}, AT={'有' if tokens.get('access_token') else '无'}")
         return email, password, True, None, (tokens if tokens else None)
     except RegistrationCancelled:
         print("[*] 注册已停止", flush=True)

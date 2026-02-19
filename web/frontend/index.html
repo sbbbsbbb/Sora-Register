@@ -167,8 +167,8 @@
                 <button type="button" id="btn-clear-logs" class="log-panel-refresh log-panel-clear" title="清空">清空</button>
               </div>
             </div>
-            <div class="log-list log-list-fixed" id="log-list"></div>
             <div class="log-panel-expand" id="log-expand-area"></div>
+            <div class="log-list log-list-fixed" id="log-list"></div>
           </div>
         </section>
         <section id="panel-settings" class="panel hidden">
@@ -204,6 +204,12 @@
               <p class="settings-card-desc">开通 Plus 等流程中会遇到 hCaptcha，可使用 <a href="https://2captcha.com/" target="_blank" rel="noopener">2Captcha</a> 打码。</p>
               <label>API 地址 <input type="text" name="captcha_api_url" placeholder="https://2captcha.com" /></label>
               <label>API KEY <input type="password" name="captcha_api_key" placeholder="2Captcha API Key" autocomplete="off" /></label>
+            </div>
+            <div class="settings-card">
+              <h3>OAuth / 注册换 Token</h3>
+              <p class="settings-card-desc">填写 OAuth Client ID 后，注册成功会先尝试从 callback 取 code 换 token；若无则自动再走一遍「邮箱+密码」登录，用 redirect_uri=http://localhost:1455/auth/callback 从 302 取 code 换 AT/RT 并写入账号管理。OAuth 应用需允许该 redirect_uri。</p>
+              <label>OAuth Client ID <input type="text" name="oauth_client_id" placeholder="OpenAI OAuth 应用 client_id" autocomplete="off" /></label>
+              <label>OAuth Redirect URI <input type="text" name="oauth_redirect_uri" placeholder="留空则用 https://chatgpt.com/（登录取 code 时固定用 localhost:1455）" /></label>
             </div>
             <div class="settings-card">
               <h3>运行参数</h3>

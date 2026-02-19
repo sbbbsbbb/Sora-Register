@@ -849,10 +849,12 @@ body {
   border: none;
   border-radius: 0;
   flex: 1;
-  min-height: 0;
-  max-height: none;
+  min-height: 120px;
   overflow-y: auto;
   overflow-x: hidden;
+}
+.log-panel .log-list.log-list-expanded {
+  min-height: 160px;
 }
 /* 日志区滚动条美化（深色主题，仅列表内一条滚动条） */
 .log-panel .log-list::-webkit-scrollbar {
@@ -879,25 +881,61 @@ body {
 }
 .log-panel-expand {
   flex-shrink: 0;
-  padding: 0.4rem 0;
-  border-top: 1px solid var(--border, #333);
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border, #333);
+  background: #151515;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.log-panel-expand:empty,
+.log-panel-expand[style*="display: none"] {
+  display: none !important;
+}
+.log-panel-expand--done {
+  padding: 0.45rem 1rem;
 }
 .log-panel-expand-btn {
-  background: transparent;
-  border: 1px solid #6b7280;
-  color: #9ca3af;
-  padding: 0.25rem 0.6rem;
-  font-size: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: #252525;
+  border: 1px solid #4b5563;
+  color: #d1d5db;
+  padding: 0.4rem 0.85rem;
+  font-size: 0.8125rem;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: 6px;
+  font-family: var(--font);
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
 .log-panel-expand-btn:hover {
-  color: #d4d4d4;
-  border-color: #9ca3af;
+  background: #2d2d2d;
+  border-color: #6b7280;
+  color: #f3f4f6;
+}
+.log-panel-expand-icon {
+  font-size: 0.6rem;
+  opacity: 0.85;
 }
 .log-panel-expand-done {
+  color: #9ca3af;
+  font-size: 0.8125rem;
+}
+.log-panel-collapse-btn {
+  background: transparent;
+  border: none;
   color: #6b7280;
-  font-size: 0.85rem;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  padding: 0.2rem 0.4rem;
+  font-family: var(--font);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.log-panel-collapse-btn:hover {
+  color: #9ca3af;
 }
 
 /* 邮箱管理 - Hotmail007 拉取卡片 */

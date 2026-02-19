@@ -54,11 +54,16 @@ def init_db():
                 phone_bound INTEGER DEFAULT 0,
                 proxy TEXT,
                 refresh_token TEXT,
+                access_token TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)")
+        try:
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_unique ON accounts(LOWER(TRIM(email)))")
+        except Exception:
+            pass
         # 邮箱管理
         c.execute("""
             CREATE TABLE IF NOT EXISTS emails (
@@ -125,11 +130,16 @@ def init_db():
             c.execute("ALTER TABLE phone_numbers ADD COLUMN expired_at TEXT")
         except Exception:
             pass
+        try:
+            c.execute("ALTER TABLE accounts ADD COLUMN access_token TEXT")
+        except Exception:
+            pass
         # 插入默认设置键
         defaults = [
             "sms_api_url", "sms_api_key", "thread_count", "proxy_url", "proxy_api_url",
             "bank_card_api_url", "bank_card_api_key", "email_api_url", "email_api_key",
-            "card_use_limit", "phone_bind_limit"
+            "card_use_limit", "phone_bind_limit",
+            "oauth_client_id", "oauth_redirect_uri",
         ]
         for key in defaults:
             c.execute(
@@ -173,7 +183,7 @@ def init_db():
             ]
             for email, pwd, status, reg_at, sora, plus, phone, proxy, rt in test_rows:
                 c.execute(
-                    """INSERT INTO accounts (email, password, status, registered_at, has_sora, has_plus, phone_bound, proxy, refresh_token)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (email, pwd, status, reg_at, sora, plus, phone, proxy or None, rt or None)
+                    """INSERT INTO accounts (email, password, status, registered_at, has_sora, has_plus, phone_bound, proxy, refresh_token, access_token)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (email, pwd, status, reg_at, sora, plus, phone, proxy or None, rt or None, None)
                 )

@@ -24,12 +24,16 @@ def set_task_config(
     timeout=DEFAULT_HTTP_TIMEOUT,
     user_agent=None,
     http_max_retries=5,
+    oauth_client_id=None,
+    oauth_redirect_uri=None,
 ):
     """由 registration_runner 在每任务开始前调用，设置当前线程的注册配置。"""
     _reg_task.proxy_url = proxy_url
     _reg_task.timeout = timeout
     _reg_task.user_agent = user_agent
     _reg_task.http_max_retries = http_max_retries
+    _reg_task.oauth_client_id = oauth_client_id if oauth_client_id is not None else getattr(_reg_task, "oauth_client_id", "")
+    _reg_task.oauth_redirect_uri = oauth_redirect_uri if oauth_redirect_uri is not None else getattr(_reg_task, "oauth_redirect_uri", "")
 
 
 def clear_task_config():
@@ -58,15 +62,25 @@ def get_user_agent():
 
 
 def _make_cfg():
-    """最小 cfg：仅 protocol_register 用到的 retry.http_max_retries（按线程动态）。"""
+    """最小 cfg：protocol_register 用到的 retry、oauth（按线程动态，oauth 来自系统设置）。"""
 
     class _Retry:
         @property
         def http_max_retries(self):
             return getattr(_reg_task, "http_max_retries", 5)
 
+    class _OAuth:
+        @property
+        def client_id(self):
+            return getattr(_reg_task, "oauth_client_id", None) or ""
+
+        @property
+        def redirect_uri(self):
+            return getattr(_reg_task, "oauth_redirect_uri", None) or ""
+
     cfg = types.SimpleNamespace()
     cfg.retry = _Retry()
+    cfg.oauth = _OAuth()
     return cfg
 
 

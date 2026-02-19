@@ -31,7 +31,8 @@ def _get_registration_settings() -> dict:
         c = conn.cursor()
         c.execute(
             """SELECT key, value FROM system_settings WHERE key IN (
-            'thread_count', 'retry_count', 'proxy_url', 'email_api_url', 'email_api_key'
+            'thread_count', 'retry_count', 'proxy_url', 'email_api_url', 'email_api_key',
+            'oauth_client_id', 'oauth_redirect_uri'
             )"""
         )
         rows = c.fetchall()
@@ -128,16 +129,23 @@ def _run_one_registration(
         try:
             with get_db() as conn:
                 c = conn.cursor()
+                created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 c.execute(
-                    "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                    (task_id, "info", (msg or "")[:500]),
+                    "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "info", (msg or "")[:500], created),
                 )
         except Exception:
             pass
         if _print_steps and msg:
             print(f"  [step] {msg}", flush=True)
 
-    set_task_config(proxy_url=proxy_url, timeout=60, http_max_retries=5)
+    set_task_config(
+        proxy_url=proxy_url,
+        timeout=60,
+        http_max_retries=5,
+        oauth_client_id=settings.get("oauth_client_id") or "",
+        oauth_redirect_uri=settings.get("oauth_redirect_uri") or "",
+    )
     try:
         result = pr.register_one_protocol(
             email,
@@ -152,17 +160,19 @@ def _run_one_registration(
     except pr.RetryException as e:
         with get_db() as conn:
             c = conn.cursor()
+            created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             c.execute(
-                "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                (task_id, "info", f"409 会话已清理，将重试 {email}: {e!s}"),
+                "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "info", f"409 会话已清理，将重试 {email}: {e!s}", created),
             )
         return False, str(e), None
     except Exception as e:
         with get_db() as conn:
             c = conn.cursor()
+            created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             c.execute(
-                "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                (task_id, "error", f"注册异常 {email}: {e!s}"),
+                "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "error", f"注册异常 {email}: {e!s}", created),
             )
         return False, str(e), None
     finally:
@@ -214,27 +224,30 @@ def run_one_with_retry(
         pwd = _random_password()
     retry_count = max(1, min(5, int(settings.get("retry_count") or "2")))
     last_error = None
+    _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-            (task_id, "info", f"正在注册账号 {email}"),
+            "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "info", f"正在注册账号 {email}", _now),
         )
     if is_stop_requested():
         with get_db() as conn:
             c = conn.cursor()
+            created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             c.execute(
-                "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                (task_id, "info", f"任务已停止，跳过 {email}"),
+                "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "info", f"任务已停止，跳过 {email}", created),
             )
         return False
     for attempt in range(retry_count):
         if is_stop_requested():
             with get_db() as conn:
                 c = conn.cursor()
+                created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 c.execute(
-                    "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                    (task_id, "info", f"任务已停止，跳过 {email}"),
+                    "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "info", f"任务已停止，跳过 {email}", created),
                 )
             return False
         use_settings = settings
@@ -259,9 +272,10 @@ def run_one_with_retry(
             print("[*] retry: no proxy + USE_DIRECT_AUTH=1", flush=True)
             with get_db() as conn:
                 c = conn.cursor()
+                created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 c.execute(
-                    "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                    (task_id, "info", "重试：无代理 + 直连 auth"),
+                    "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "info", "重试：无代理 + 直连 auth", created),
                 )
         try:
             success, status_extra, tokens = _run_one_registration(
@@ -286,39 +300,44 @@ def run_one_with_retry(
                     pass
             try:
                 rt = ""
+                at = ""
                 if isinstance(tokens, dict):
                     rt = tokens.get("refresh_token") or ""
                     if not rt and isinstance(tokens.get("session"), dict):
                         rt = (tokens.get("session") or {}).get("refresh_token") or ""
                     rt = (rt or "").strip() if rt else ""
+                    at = (tokens.get("access_token") or "").strip() or None
                 with get_db() as conn:
                     c = conn.cursor()
                     c.execute(
-                        """INSERT INTO accounts (email, password, status, registered_at, has_sora, has_plus, phone_bound, proxy, refresh_token)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        """INSERT OR REPLACE INTO accounts (email, password, status, registered_at, has_sora, has_plus, phone_bound, proxy, refresh_token, access_token)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             email,
                             pwd,
                             "Registered+Sora" if tokens else "Registered",
-                            datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+                            datetime.now().strftime("%Y-%m-%d %H:%M"),
                             1 if tokens else 0,
                             0,
                             0,
                             (same_proxy or ""),
                             rt or None,
+                            at,
                         ),
                     )
+                    created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     c.execute(
-                        "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                        (task_id, "info", f"注册成功 {email}"),
+                        "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                        (task_id, "info", f"注册成功 {email}", created),
                     )
                     try:
                         from app.database import DB_PATH
                         c.execute("SELECT COUNT(*) FROM accounts")
                         n = c.fetchone()[0]
+                        created2 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         c.execute(
-                            "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                            (task_id, "info", f"账号已写入 accounts 表，数据文件: {DB_PATH}，当前共 {n} 条"),
+                            "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                            (task_id, "info", f"账号已写入 accounts 表，数据文件: {DB_PATH}，当前共 {n} 条", created2),
                         )
                     except Exception:
                         pass
@@ -330,27 +349,30 @@ def run_one_with_retry(
                         (str(prev_ok + 1),),
                     )
             except Exception as e:
+                created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with get_db() as conn:
                     c = conn.cursor()
                     c.execute(
-                        "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                        (task_id, "error", f"注册成功但写入账号列表失败 {email}: {e!s}"),
+                        "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                        (task_id, "error", f"注册成功但写入账号列表失败 {email}: {e!s}", created),
                     )
                 return False
             return True
         last_error = status_extra or "注册失败"
         with get_db() as conn:
             c = conn.cursor()
+            created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             c.execute(
-                "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-                (task_id, "error", f"尝试 {attempt + 1}/{retry_count} 失败 {email}: {last_error}"),
+                "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "error", f"尝试 {attempt + 1}/{retry_count} 失败 {email}: {last_error}", created),
             )
 
     with get_db() as conn:
         c = conn.cursor()
+        created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         c.execute(
-            "INSERT INTO run_logs (task_id, level, message) VALUES (?, ?, ?)",
-            (task_id, "error", f"注册失败 {email} (已重试 {retry_count} 次)"),
+            "INSERT INTO run_logs (task_id, level, message, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "error", f"注册失败 {email} (已重试 {retry_count} 次)", created),
         )
         c.execute("SELECT value FROM system_settings WHERE key = 'last_run_fail'")
         row = c.fetchone()

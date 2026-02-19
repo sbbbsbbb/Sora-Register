@@ -814,8 +814,10 @@ function loadDashboard() {
     document.getElementById("dash-threads").textContent = "—";
   });
 }
+var currentLogLimit = 20;
 function loadLogs(limit) {
-  limit = Math.min(Math.max(limit || 20, 1), 100);
+  if (limit != null && limit !== undefined) currentLogLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  limit = currentLogLimit;
   api("/api/logs?page=1&page_size=" + limit).then(function(d) {
     var list = document.getElementById("log-list");
     var items = d.items || [];
@@ -823,21 +825,26 @@ function loadLogs(limit) {
     var titleEl = document.getElementById("log-panel-title");
     var expandEl = document.getElementById("log-expand-area");
     if (titleEl) titleEl.textContent = "最近 " + limit + " 条日志";
+    list.classList.toggle("log-list-expanded", limit > 20);
     list.innerHTML = items.length ? items.map(function(r) {
       var levelClass = (r.level === "error") ? " log-line--error" : " log-line--info";
       return "<div class=\"log-line" + levelClass + "\"><span class=\"ts\">" + escapeHtml(r.created_at) + "</span> " + escapeHtml(r.message) + "</div>";
     }).join("") : "<div class=\"log-line log-line--info\">暂无日志</div>";
     if (expandEl) {
       if (limit < 100 && total > 20) {
-        expandEl.innerHTML = "<button type=\"button\" id=\"btn-expand-logs\" class=\"log-panel-expand-btn\">展开更多（最多100条）</button>";
+        expandEl.innerHTML = "<button type=\"button\" id=\"btn-expand-logs\" class=\"log-panel-expand-btn\"><span class=\"log-panel-expand-icon\" aria-hidden=\"true\">▼</span> 展开更多（最多 100 条）</button>";
         expandEl.style.display = "";
+        expandEl.className = "log-panel-expand";
         document.getElementById("btn-expand-logs").addEventListener("click", function() { loadLogs(100); });
       } else if (limit === 100 && total > 20) {
-        expandEl.innerHTML = "<span class=\"log-panel-expand-done\">已显示最多100条</span>";
+        expandEl.innerHTML = "<span class=\"log-panel-expand-done\">已显示最多 100 条</span> <button type=\"button\" id=\"btn-collapse-logs\" class=\"log-panel-collapse-btn\">收起</button>";
         expandEl.style.display = "";
+        expandEl.className = "log-panel-expand log-panel-expand--done";
+        document.getElementById("btn-collapse-logs").addEventListener("click", function() { loadLogs(20); });
       } else {
         expandEl.innerHTML = "";
         expandEl.style.display = "none";
+        expandEl.className = "log-panel-expand";
       }
     }
   }).catch(function() {
@@ -899,7 +906,8 @@ document.getElementById("btn-clear-logs").addEventListener("click", function() {
 var SETTINGS_KEYS = [
   "sms_api_url", "sms_api_key", "sms_openai_service", "sms_max_price", "thread_count", "proxy_url", "proxy_api_url",
   "bank_card_api_url", "bank_card_api_key", "bank_card_api_platform", "email_api_url", "email_api_key", "email_api_default_type",
-  "captcha_api_url", "captcha_api_key", "retry_count", "card_use_limit", "phone_bind_limit"
+  "captcha_api_url", "captcha_api_key", "oauth_client_id", "oauth_redirect_uri",
+  "retry_count", "card_use_limit", "phone_bind_limit"
 ];
 function loadSettings() {
   api("/api/settings").then((d) => {
@@ -915,7 +923,14 @@ document.getElementById("settings-form").addEventListener("submit", (e) => {
   const fd = new FormData(e.target);
   const body = {};
   SETTINGS_KEYS.forEach((k) => { body[k] = fd.get(k) || ""; });
-  api("/api/settings", { method: "PUT", body: JSON.stringify(body) }).then(() => toast("已保存"));
+  api("/api/settings", { method: "PUT", body: JSON.stringify(body) })
+    .then(() => {
+      toast("已保存");
+      loadSettings();
+    })
+    .catch((err) => {
+      toast(err && err.message ? err.message : "保存失败");
+    });
 });
 
 function escapeHtml(s) {

@@ -44,7 +44,7 @@ def list_accounts(
         offset = (page - 1) * page_size
         c.execute(
             f"""SELECT id, email, password, status, registered_at,
-                   has_sora, has_plus, phone_bound, proxy, refresh_token, created_at
+                   has_sora, has_plus, phone_bound, proxy, refresh_token, access_token, created_at
             FROM accounts WHERE {where_sql}
             ORDER BY id DESC LIMIT ? OFFSET ?""",
             params + [page_size, offset]
@@ -63,7 +63,8 @@ def list_accounts(
             "phone_bound": bool(r[7]),
             "proxy": r[8],
             "refresh_token": (r[9] or "")[:20] + "..." if r[9] else "",
-            "created_at": r[10],
+            "access_token": (r[10] or "")[:20] + "..." if r[10] else "",
+            "created_at": r[11],
         })
     return {"total": total, "page": page, "page_size": page_size, "items": items}
 
@@ -91,19 +92,19 @@ def export_accounts(
             params.append(1 if has_plus else 0)
         where_sql = " AND ".join(where) if where else "1=1"
         c.execute(
-            f"""SELECT email, password, status, registered_at, has_sora, has_plus, phone_bound, proxy, refresh_token
+            f"""SELECT email, password, status, registered_at, has_sora, has_plus, phone_bound, proxy, refresh_token, access_token
             FROM accounts WHERE {where_sql} ORDER BY id DESC""",
             params
         )
         rows = c.fetchall()
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["email", "password", "status", "registered_at", "has_sora", "has_plus", "phone_bound", "proxy", "refresh_token"])
+    writer.writerow(["email", "password", "status", "registered_at", "has_sora", "has_plus", "phone_bound", "proxy", "refresh_token", "access_token"])
     for r in rows:
         writer.writerow([
             r[0], r[1], r[2], r[3],
             "Y" if r[4] else "N", "Y" if r[5] else "N", "Y" if r[6] else "N",
-            r[7] or "", r[8] or ""
+            r[7] or "", r[8] or "", r[9] or ""
         ])
     buf.seek(0)
     return StreamingResponse(
